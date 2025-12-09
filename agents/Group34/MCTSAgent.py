@@ -1,277 +1,335 @@
-from random import choice
 import math
-from random import random
+from random import choice
+from time import time
 
-from src.AgentBase import AgentBase
 from src.Board import Board
 from src.Colour import Colour
 from src.Move import Move
+from src.AgentBase import AgentBase
 
 
 class MCTSAgent(AgentBase):
-    """This class describes the default Hex agent. It will randomly send a
-    valid move at each turn, and it will choose to swap with a 50% chance.
-
-    The class inherits from AgentBase, which is an abstract class.
-    The AgentBase contains the colour property which you can use to get the agent's colour.
-    You must implement the make_move method to make the agent functional.
-    You CANNOT modify the AgentBase class, otherwise your agent might not function.
-    """
-
-    _choices: list[Move]
-    _board_size: int = 11
-
-    def __init__(self, colour: Colour):
+    
+    _root: 'MCTSAgent.MCTSNode | None' = None
+    
+    def __init__(self, colour):
         super().__init__(colour)
-        self._choices = [
-            (i, j) for i in range(self._board_size) for j in range(self._board_size)
-        ]
-        self.tree = None
+    
+    def make_move(self, turn: int, board, opp_move) -> Move:
+        moves = self.get_pruned_moves(board, turn)
+        root = self.MCTSNode(board, self.colour, moves)
+
+        
+        return root.get_best_move(1)
+
+    def update_root(self, turn: int, board, opp_move):
+        if self._root == None:
+            return MCTSAgent.MCTSNode(board, self.colour, self.get_all_valid_moves(board, turn))
+        else:
+            for child in self._root.children:
+                if child.associated_move == opp_move:
+                    child.parent = None
+                    return child
 
     @staticmethod
-    def clone_board(board: Board) -> Board:
-        new = Board(board.size)
+    def get_all_valid_moves(board, turn = -1):
+        BOARD_SIZE = 11
+        moves = [
+            Move(i, j)
+            for i in range(BOARD_SIZE)
+            for j in range(BOARD_SIZE)
+            if board.tiles[i][j].colour is None
+        ]
+        if turn == 2:
+            moves.append(Move(-1, -1))
+        return moves
+    
+    @staticmethod
+    def clone_board(board):
+        new_board = Board(11)
         for i in range(board.size):
             for j in range(board.size):
-                new_tile = new.tiles[i][j]
-                old_tile = board.tiles[i][j]
-                new_tile.colour = old_tile.colour
-        return new
+                new_board.set_tile_colour(i, j, board.tiles[i][j].colour)
+        return new_board
     
+    @staticmethod
+    def has_nearby_stone(board: Board, move: Move) -> bool:
+        x, y = move.x, move.y
+        size = board.size
+        # Hex 6-neighbour offsets
+        offsets = [(-1, 0), (1, 0),
+                   (0, -1), (0, 1),
+                   (-1, 1), (1, -1)]
+        for dx, dy in offsets:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < size and 0 <= ny < size:
+                if board.tiles[nx][ny].colour is not None:
+                    return True
+        return False
+
+    @staticmethod
+    def get_pruned_moves(board: Board, turn=-1):
+        # If early game, don’t prune too aggressively
+        empty_count = sum(
+            1 for i in range(board.size)
+              for j in range(board.size)
+              if board.tiles[i][j].colour is None
+        )
+
+        BASE_MOVES = [
+            Move(i, j)
+            for i in range(board.size)
+            for j in range(board.size)
+            if board.tiles[i][j].colour is None
+        ]
+
+        if turn == 2:
+            BASE_MOVES.append(Move(-1, -1))
+
+        # If very early, just return all
+        if empty_count > board.size * board.size - 4:
+            return BASE_MOVES
+
+        pruned = [
+            m for m in BASE_MOVES
+            if MCTSAgent.has_nearby_stone(board, m)
+        ]
+
+        # Fallback: if everything pruned (weird positions), use all
+        return pruned if pruned else BASE_MOVES
+
     class MCTSNode:
-        def __init__(self, state: Board, player: Colour, root_colour, parent=None, action=None):
-            self.state = state
-            self.player = player
-            self.root_colour = root_colour
-            self.parent = parent
-            self.action = action
-            self.children = []
-            self.visits = 0
+        def __init__(self, board, colour, moves, associated_move=None, parent=None):
+            self.board: Board = board
+            self.parent: MCTSAgent.MCTSNode | None = parent
+            self.colour: Colour = colour
+            self.moves: list[Move] = moves
+            self.associated_move: Move = associated_move # Move that led to this node
+            self.children: list[MCTSAgent.MCTSNode] = []
             self.wins = 0
-            self.untried_actions = self.get_actions()
+            self.visits = 0
 
-        def get_actions(self):
-  
-            board = self.state
-            return [
-                (i, j)
-                for i in range(board.size)
-                for j in range(board.size)
-                if (board.tiles[i][j]).colour is None
-            ]
+            # AMAF / RAVE stats: (x,y) -> [wins, visits]
+            self.amaf_stats: dict[tuple[int, int], list[int]] = {}
+            
+        def select_child(self):
+            if not self.is_fully_expanded():
+                return self
 
-        def is_terminal(self):
-            """Check if the game has ended"""
-            return self.check_winner() is not None or not self.get_actions()
+            def score(child: 'MCTSAgent.MCTSNode'):
+                if child.visits == 0:
+                    return float('inf')
+
+                Q = child.wins / child.visits
+
+                # AMAF value for this move from this node’s perspective
+                mv = (child.associated_move.x, child.associated_move.y) if child.associated_move is not None else None
+                if mv is not None and mv in self.amaf_stats and self.amaf_stats[mv][1] > 0:
+                    amaf_wins, amaf_visits = self.amaf_stats[mv]
+                    Q_amaf = amaf_wins / amaf_visits
+                else:
+                    Q_amaf = 0.5  # neutral
+
+                # Mix factor beta: high when visits small, shrinking as visits grow
+                k = 300.0
+                beta = k / (self.visits + k)
+
+                mixed_Q = (1 - beta) * Q + beta * Q_amaf
+
+                
+                exploration = math.sqrt(math.log(self.visits) / child.visits)
+                C = 0.5  # smaller than 1.4 
+
+                return mixed_Q + C * exploration
+
+            return max(self.children, key=score).select_child()
+
         
+        def best_move(self):
+            best_child = max(self.children, key=lambda c: c.visits)
+            return best_child
+
+        def get_best_move(self, seconds: float = 1.0) -> Move:
+            
+            current_time = time()
+            simulation_count = 0
+            while time() - current_time < seconds:
+                node = self.select_child()                
+                node.expand().simulate_random_playout()
+                simulation_count += 1
+
+            print(f"Simulations: {simulation_count}")
+            
+            return self.best_move().associated_move
+
         def is_fully_expanded(self):
-            """Check is there are any more actions left"""
-            return len(self.untried_actions) == 0
-        
-        def check_winner(self):
-            board = self.state
-            if board.has_ended(Colour.RED):
-                return Colour.RED
-            if board.has_ended(Colour.BLUE):
-                return Colour.BLUE
-            return None
-        
-
-        
+            return self.moves == []
         
         def expand(self):
-            action = self.untried_actions.pop()
+            move = self.moves.pop()
+            new_board = self.simulate_move(self.board, move)
+            child_node = MCTSAgent.MCTSNode(
+                        new_board,
+                        Colour.opposite(self.colour),
+                        MCTSAgent.get_pruned_moves(new_board),
+                        move,
+                        parent=self
+                    )
 
-            new_state = MCTSAgent.clone_board(self.state)
-
-            x, y = action
-            new_state.set_tile_colour(x, y, self.player)
-
-            next_player = Colour.opposite(self.player)
-            child = MCTSAgent.MCTSNode(new_state, next_player, self.root_colour, parent=self, action=action)
-            self.children.append(child)
-            return child
+            self.children.append(child_node)
+            return child_node
         
+        def simulate_move(self, board, move):
+            new_board = MCTSAgent.clone_board(board)
+            new_board.set_tile_colour(move.x, move.y, self.colour)
+            return new_board
         
-        def best_child(self, c=1.4):
-            """Select child with best UCB1 score."""
-            def ucb(child):
+        def simulate_random_playout(self):
+            current_board = MCTSAgent.clone_board(self.board)
+            current_colour = self.colour
 
-                if child.visits == 0:
-                    return float("inf")
-                
-                return ((child.wins / child.visits) +
-                         c * math.sqrt(math.log(self.visits + 1) / child.visits))
+            last_move: Move | None = None
+            playout_moves: list[tuple[int, int]] = []  # record all moves
 
-            return max(self.children, key=ucb)
-        
-        def rollout(self):
-            state = MCTSAgent.clone_board(self.state)
-            player = self.player
-
-            def neighbours(x, y, size):
-                pos = [
-                        (-1, 0), (1, 0),
-                        (0, -1), (0, 1),
-                        (-1, 1), (1, -1)
-                    ]
-                for dx, dy in pos:
-                    nx, ny = x + dx, y + dy
-                    if 0 <= nx < size and 0 <= ny < size:
-                        yield nx, ny
-
-            def biased_random_action(state, player, actions):
-                epsilon = 0.1
-                if random() < epsilon:
-                    return choice(actions)
-                a = 3.0  # bias for own neighbours
-                b = 1.0  # bias for opponent neighbours
-
-                scores = []
-                opp = Colour.opposite(player)
-
-                for (x, y) in actions:
-                    n_self = 0
-                    n_opp = 0
-
-                    for nx, ny in neighbours(x, y, state.size):
-                        c = state.tiles[nx][ny].colour
-                        if c is None:
-                            continue
-                        if c == player:
-                            n_self += 1
-                        elif c == opp:
-                            n_opp += 1
-
-                    score = 1.0 + a * n_self + b * n_opp
-                    scores.append(score)
-            
-                # If all scores are 0 (shouldn't happen with the +1, but just in case)
-                total = sum(scores)
-                if total <= 0:
-                    return choice(actions)
-                
-                # Sample proportional to score (simple roulette-wheel selection)
-                r = random() * total
-                acc = 0.0
-                for (x, y), w in zip(actions, scores):
-                    acc += w
-                    if r <= acc:
-                        return x, y
-                
-                # Fallback (numerical edge case)
-                return actions[-1]
-
-    
-            while True:
-                if state.has_ended(Colour.RED):
-                    winner = Colour.RED
-                elif state.has_ended(Colour.BLUE):
-                    winner = Colour.BLUE
-                else:
-                    winner = None
-
-                if winner is not None:
-                    return 1.0 if winner == self.root_colour else 0.0
-                
-
-                actions = [
-                            (i, j)
-                            for i in range(state.size)
-                            for j in range(state.size)
-                            if (state.tiles[i][j]).colour is None
-                        ]
-                
-                if not actions: return 0.5
-
-                x, y = biased_random_action(state, player, actions)
-                state.set_tile_colour(x, y, player)
-
-                player = Colour.opposite(player)
-
-        def backpropagate(self, result):
-            self.visits += 1
-            self.wins += result
-            if self.parent:
-                self.parent.backpropagate(result)
-                
-        
-    def mcts_search(self, root: "MCTSAgent.MCTSNode", iterations=100) -> Move:
-
-        for _ in range(iterations):
-            # print("Iteration ->",_)
-            node = root
-
-            # Selection
-            while not node.is_terminal() and node.is_fully_expanded():
-                node = node.best_child()
-            
-            # Expansion
-            if not node.is_terminal():
-                node = node.expand()
-            
-            # TODO:
-            # - add rollout (simulation)
-            # - add backpropagation of result
-
-            # Simulation
-            result = node.rollout()
-
-            # Backpropagation
-            node.backpropagate(result)
-        
-        # For now, just pick a legal move from the root as a fallback
-        # actions = root.get_actions()
-        # if not actions:
-        #     # should never happen in a non-terminal game, but just in case
-        #     return Move(0, 0)
-
-        # x, y = choice(actions)
-        best_child = root.best_child(c=0)
-        x, y = best_child.action
-        return Move(x, y)
-
-
-    def make_move(self, turn: int, board: Board, opp_move: Move | None) -> Move:
-        """The game engine will call this method to request a move from the agent.
-        If the agent is to make the first move, opp_move will be None.
-        If the opponent has made a move, opp_move will contain the opponent's move.
-        If the opponent has made a swap move, opp_move will contain a Move object with x=-1 and y=-1,
-        the game engine will also change your colour to the opponent colour.
-
-        Args:
-            turn (int): The current turn
-            board (Board): The current board state
-            opp_move (Move | None): The opponent's last move
-
-        Returns:
-            Move: The agent's move
-        """
-        
-        # if turn == 2 and choice([0, 1]) == 1:
-        if turn == 2:
-            return Move(-1, -1)
-        else:
-            player = self.colour
-            
-            if self.tree is None:
-                self.tree = MCTSAgent.MCTSNode(board, player, self.colour)
-
-            elif opp_move is not None and (opp_move.x, opp_move.y) != (-1, -1):
-                for child in self.tree.children:
-                    if child.action == (opp_move.x, opp_move.y):
-                        self.tree = child
-                        self.tree.parent = None
-                        break
-            
-            best_move = self.mcts_search(self.tree, iterations=100)
-
-            for child in self.tree.children:
-                if child.action == (best_move.x, best_move.y):
-                    self.tree = child
-                    self.tree.parent = None
+            while not self._is_game_ended(current_board):
+                possible_moves = MCTSAgent.get_all_valid_moves(current_board)
+                if not possible_moves:
                     break
 
-            return best_move
+                forced_move = None
+                if last_move is not None:
+                    forced_move = self._find_bridge_response(current_board, last_move, current_colour)
 
-    #  python3 Hex.py -p1 "agents.Group34.MCTSAgent MCTSAgent" -p2 "agents.MCTSAgent.MCTSAgent MCTSAgent"
+                if forced_move is not None:
+                    move = forced_move
+                else:
+                    move = choice(possible_moves)
+
+                current_board.set_tile_colour(move.x, move.y, current_colour)
+                playout_moves.append((move.x, move.y))
+
+                last_move = move
+                current_colour = Colour.opposite(current_colour)
+
+            winner = current_board.get_winner()
+            self.backpropagate(winner, playout_moves)
+
+
+            
+        def _find_bridge_response(self, board: Board, last_move: Move, current_colour: Colour) -> Move | None:
+            """
+            If last_move just probed a bridge belonging to current_colour,
+            return the forced reply (the other eye of the bridge), else None.
+
+            We approximate the classic Hex bridge with a diamond in (x,y) coords:
+              anchors: (x, y) and (x+1, y+1)
+              eyes:    (x, y+1) and (x+1, y)
+            and the symmetric one:
+              anchors: (x, y) and (x+1, y-1)
+              eyes:    (x, y-1) and (x+1, y)
+            """
+            x, y = last_move.x, last_move.y
+            size = board.size
+
+            def in_bounds(i, j):
+                return 0 <= i < size and 0 <= j < size
+
+            # List of candidate patterns: each is (eye1, eye2, anchor1, anchor2)
+            patterns = []
+
+            # Diagonal / shape up-right
+            # eyes: (x, y) and (x+1, y) or (x, y+1)
+            # We'll consider last_move as one eye, other_eye computed accordingly
+            # Pattern 1: last_move is upper eye of diag up-right: (x, y) = (x, y+1)
+            patterns.append((
+                (x, y),           # eye1 (where last_move might be)
+                (x + 1, y - 1),   # eye2
+                (x, y - 1),       # anchor1
+                (x + 1, y)        # anchor2
+            ))
+
+            # Pattern 2: last_move is lower eye of diag up-right: (x, y) = (x+1, y)
+            patterns.append((
+                (x, y),           # eye1
+                (x - 1, y + 1),   # eye2
+                (x - 1, y),       # anchor1
+                (x, y + 1)        # anchor2
+            ))
+
+            # Diagonal / shape up-left
+            # Pattern 3: last_move is upper eye of diag up-left: (x, y) = (x, y-1)
+            patterns.append((
+                (x, y),           # eye1
+                (x + 1, y + 1),   # eye2
+                (x, y + 1),       # anchor1
+                (x + 1, y)        # anchor2
+            ))
+
+            # Pattern 4: last_move is lower eye of diag up-left: (x, y) = (x+1, y)
+            patterns.append((
+                (x, y),           # eye1
+                (x - 1, y - 1),   # eye2
+                (x - 1, y),       # anchor1
+                (x, y - 1)        # anchor2
+            ))
+
+            for eye1, eye2, a1, a2 in patterns:
+                ex1, ey1 = eye1
+                ex2, ey2 = eye2
+                ax1, ay1 = a1
+                ax2, ay2 = a2
+
+                if not (in_bounds(ex2, ey2) and in_bounds(ax1, ay1) and in_bounds(ax2, ay2)):
+                    continue
+
+                # last_move must be at eye1
+                if (x, y) != (ex1, ey1):
+                    continue
+
+                # anchors must exist and belong to current_colour
+                if board.tiles[ax1][ay1].colour != current_colour:
+                    continue
+                if board.tiles[ax2][ay2].colour != current_colour:
+                    continue
+
+                # other eye must be empty
+                if board.tiles[ex2][ey2].colour is None:
+                    return Move(ex2, ey2)
+
+            return None
+
+        def _is_game_ended(self, board: Board) -> bool:
+            try:
+                return board.has_ended(Colour.RED) or board.has_ended(Colour.BLUE)
+            except ValueError:
+                return False
+
+        def backpropagate(self, winner, playout_moves=None):
+            if playout_moves is None:
+                playout_moves = []
+            root = self
+            while root.parent is not None:
+                root = root.parent
+
+            node = self
+            while node is not None:
+                node.visits += 1
+                if root.colour == winner:
+                    node.wins += 1
+
+                    # AMAF: give this playout’s moves credit as well
+                    for (mx, my) in playout_moves:
+                        key = (mx, my)
+                        if key not in node.amaf_stats:
+                            node.amaf_stats[key] = [0, 0]
+                        node.amaf_stats[key][0] += 1  # amaf wins
+                        node.amaf_stats[key][1] += 1  # amaf visits
+                else:
+                    # Even if lost, still increment AMAF visits
+                    for (mx, my) in playout_moves:
+                        key = (mx, my)
+                        if key not in node.amaf_stats:
+                            node.amaf_stats[key] = [0, 0]
+                        node.amaf_stats[key][1] += 1
+
+                node = node.parent
