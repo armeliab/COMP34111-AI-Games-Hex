@@ -10,6 +10,8 @@ from src.AgentBase import AgentBase
 
 class MCTSAgentMuhammad(AgentBase):
     
+    _root: 'MCTSAgentMuhammad.MCTSNode | None' = None
+    
     def __init__(self, colour):
         super().__init__(colour)
     
@@ -17,7 +19,16 @@ class MCTSAgentMuhammad(AgentBase):
         moves = self.get_all_valid_moves(board, turn)
         root = self.MCTSNode(board, self.colour, moves)
         
-        return root.get_best_move(5)
+        return root.get_best_move(1)
+
+    def update_root(self, turn: int, board, opp_move):
+        if self._root == None:
+            return MCTSAgentMuhammad.MCTSNode(board, self.colour, self.get_all_valid_moves(board, turn))
+        else:
+            for child in self._root.children:
+                if child.associated_move == opp_move:
+                    child.parent = None
+                    return child
 
     @staticmethod
     def get_all_valid_moves(board, turn = -1):
