@@ -356,17 +356,16 @@ class MCTS {
     }
 
     Player simulate(HexBoard state, Player to_move) {
-        std::vector<Move> moves = state.legal_moves();
         Player current_player = to_move;
         
-        while (!state.is_terminal() && !moves.empty()) {
+        while (!state.is_terminal()) {
+            std::vector<Move> moves = state.legal_moves();
+            if (moves.empty()) break;
+            
             std::uniform_int_distribution<std::size_t> dist(0, moves.size() - 1);
             std::size_t rand_idx = dist(rng_);
             
             Move move = moves[rand_idx];
-            moves[rand_idx] = moves.back();
-            moves.pop_back();
-
             state.apply_move(move, current_player);
             current_player = opposite(current_player);
         }

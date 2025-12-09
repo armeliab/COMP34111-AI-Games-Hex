@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 from subprocess import PIPE, Popen, TimeoutExpired
+import sys
 import time
 
 from src.AgentBase import AgentBase
@@ -34,9 +35,11 @@ class MCTSCppAgent(AgentBase):
 
     def __init__(self, colour: Colour):
         super().__init__(colour)
-        self._binary_path = (
-            Path(__file__).with_name("bin").joinpath("mcts_cpp_agent")
-        )
+        bin_dir = Path(__file__).with_name("bin")
+        if sys.platform == "win32":
+            self._binary_path = bin_dir / "mcts_cpp_agent.exe"
+        else:
+            self._binary_path = bin_dir / "mcts_cpp_agent"
         self.agent_process: Popen | None = None
         # NOTE: Do NOT launch the process here! Launch it lazily in make_move.
         # This prevents issues when the game engine deepcopies the agent.
@@ -51,11 +54,14 @@ class MCTSCppAgent(AgentBase):
                 "g++ agents/Group34/cpp/MCTSCppAgent.cpp -O3 -std=c++17 -o agents/Group34/bin/mcts_cpp_agent"
             )
 
+        # Get simple colour character for C++ (R or B)
+        colour_char = 'R' if self.colour == Colour.RED else 'B'
+        
         # Launch the C++ process, passing colour and board size as arguments
         self.agent_process = Popen(
             [
                 str(self._binary_path),
-                self.colour.get_char(),
+                colour_char,
                 str(board_size),
             ],
             stdout=PIPE,
@@ -70,8 +76,13 @@ class MCTSCppAgent(AgentBase):
             row_string = ""
             for tile in row:
                 colour = tile.colour
-                # Colour.get_char(None) returns '0'
-                row_string += Colour.get_char(colour)
+                # Convert to simple characters: R, B, or 0 (no ANSI codes)
+                if colour == Colour.RED:
+                    row_string += 'R'
+                elif colour == Colour.BLUE:
+                    row_string += 'B'
+                else:
+                    row_string += '0'
             board_strings.append(row_string)
         return ",".join(board_strings)
 
