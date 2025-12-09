@@ -17,7 +17,7 @@ class MCTSAgentMuhammad(AgentBase):
         moves = self.get_all_valid_moves(board, turn)
         root = self.MCTSNode(board, self.colour, moves)
         
-        return root.get_best_move(2)
+        return root.get_best_move(5)
 
     @staticmethod
     def get_all_valid_moves(board, turn = -1):
@@ -46,7 +46,7 @@ class MCTSAgentMuhammad(AgentBase):
             self.parent: MCTSAgentMuhammad.MCTSNode | None = parent
             self.colour: Colour = colour
             self.moves: list[Move] = moves
-            self.associated_move: Move = associated_move
+            self.associated_move: Move = associated_move # Move that led to this node
             self.children: list[MCTSAgentMuhammad.MCTSNode] = []
             self.wins = 0
             self.visits = 0
@@ -72,13 +72,13 @@ class MCTSAgentMuhammad(AgentBase):
         def get_best_move(self, seconds: float = 1.0) -> Move:
             
             current_time = time()
-            
-            while not self.is_fully_expanded():
-                self.expand().simulate_random_playout()
-                
+            simulation_count = 0
             while time() - current_time < seconds:
-                node = self.select_child()
-                node.expand().run_simulations()
+                node = self.select_child()                
+                node.expand().simulate_random_playout()
+                simulation_count += 1
+
+            print(f"Simulations: {simulation_count}")
             
             return self.best_move().associated_move
 
@@ -112,12 +112,6 @@ class MCTSAgentMuhammad(AgentBase):
             
         
         def _is_game_ended(self, board: Board) -> bool:
-            """Safely check if the game has ended for either colour.
-
-            Board.has_ended expects a Colour; calling it without a colour
-            raises ValueError. Treat any ValueError as "not ended" so the
-            playout continues.
-            """
             try:
                 return board.has_ended(Colour.RED) or board.has_ended(Colour.BLUE)
             except ValueError:
@@ -134,9 +128,3 @@ class MCTSAgentMuhammad(AgentBase):
                 if root.colour == winner:
                     node.wins += 1
                 node = node.parent
-                
-        def run_simulations(self):
-            for _ in range(10):
-                self.simulate_random_playout()
-            
-    
