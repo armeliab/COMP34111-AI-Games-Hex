@@ -573,34 +573,34 @@ DynamicParams compute_dynamic_params(int empty_count, int board_size) {
     const int total_cells = board_size * board_size;
     const double game_progress = 1.0 - (double)empty_count / total_cells;  // 0.0 (start) to 1.0 (end)
     
-    // RAVE_K: 초반에는 높게 (RAVE 신뢰), 후반에는 낮게 (UCT 신뢰)
-    // 초반(0-30%): 300, 중반(30-70%): 200, 후반(70-100%): 100
+    // RAVE_K: Higher in early game (trust RAVE), lower in late game (trust UCT)
+    // Early (0-30%): 300, Mid (30-70%): 200, Late (70-100%): 100
     if (game_progress < 0.3) {
-        params.rave_k = 300.0;  // 초반: RAVE 많이 사용
+        params.rave_k = 300.0;  // Early: use RAVE more
     } else if (game_progress < 0.7) {
-        params.rave_k = 200.0;  // 중반: 기본값
+        params.rave_k = 200.0;  // Mid: default value
     } else {
-        params.rave_k = 100.0;  // 후반: UCT 더 신뢰
+        params.rave_k = 100.0;  // Late: trust UCT more
     }
     
-    // C_PUCT: 초반에는 높게 (탐색), 후반에는 낮게 (exploitation)
-    // 초반(0-40%): 1.0, 중반(40-80%): 0.8, 후반(80-100%): 0.6
+    // C_PUCT: Higher in early game (exploration), lower in late game (exploitation)
+    // Early (0-40%): 1.0, Mid (40-80%): 0.8, Late (80-100%): 0.6
     if (game_progress < 0.4) {
-        params.c_puct = 1.0;   // 초반: 더 많은 탐색
+        params.c_puct = 1.0;   // Early: more exploration
     } else if (game_progress < 0.8) {
-        params.c_puct = 0.8;   // 중반: 기본값
+        params.c_puct = 0.8;   // Mid: default value
     } else {
-        params.c_puct = 0.6;   // 후반: exploitation 강화
+        params.c_puct = 0.6;   // Late: stronger exploitation
     }
     
-    // VALUE_SWITCH_EMPTY: 게임 단계에 따라 조정
-    // 초반에는 rollout 더 사용, 후반에는 NN value 더 사용
+    // VALUE_SWITCH_EMPTY: Adjust based on game phase
+    // Use rollout more in early game, NN value more in late game
     if (game_progress < 0.3) {
-        params.value_switch_empty = 40;  // 초반: rollout 더 사용
+        params.value_switch_empty = 40;  // Early: use rollout more
     } else if (game_progress < 0.6) {
-        params.value_switch_empty = 45;  // 중반: 기본값
+        params.value_switch_empty = 45;  // Mid: default value
     } else {
-        params.value_switch_empty = 50;  // 후반: NN value 더 사용
+        params.value_switch_empty = 50;  // Late: use NN value more
     }
     
     return params;
