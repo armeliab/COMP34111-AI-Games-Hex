@@ -27,23 +27,25 @@ namespace {
 
 // --------------------------- Config ----------------------------
 
-// RAVE blend parameter (optional; you can disable RAVE by setting RAVE_K=0)
-double RAVE_K = 200.0;
+// Base parameters (can be overridden by dynamic tuning)
+double BASE_RAVE_K = 200.0;
+double BASE_C_PUCT = 0.8;
+int BASE_VALUE_SWITCH_EMPTY = 45;
 
-// PUCT constant
-double C_PUCT = 0.8;
+// Use dynamic parameter tuning based on game phase
+bool USE_DYNAMIC_PARAMS = true;
 
 // Use policy priors for expansion (recommended)
 bool USE_POLICY_PRIORS = true;
-
-// Switch rollout->value eval when empty <= threshold
-int VALUE_SWITCH_EMPTY = 45;
 
 // Max NN cache entries (simple eviction)
 size_t NN_CACHE_MAX = 20000;
 
 // Safety: if NN server fails, fall back to uniform policy + 0 value
 bool NN_FAIL_OPEN = true;
+
+// Opening book depth (first N moves use book)
+int BOOK_DEPTH = 3;
 
 // --------------------------- Types ----------------------------
 
@@ -213,6 +215,95 @@ class HexBoard {
     int size_ = 11;
     std::vector<CellState> cells_;
 };
+
+// --------------------------- Opening Book ----------------------------
+
+std::unordered_map<std::string, Move> opening_book;
+
+void init_opening_book() {
+    // Static initialization - only called once
+    static bool initialized = false;
+    if (initialized) return;
+    initialized = true;
+    
+    const int N = 11;
+    
+    // Helper to create board string in serialize() format: "000,000,000,..."
+    auto make_board_str = [N](const std::vector<std::string>& rows) {
+        std::string result;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (i > 0) result += ",";
+            result += rows[i];
+        }
+        // Pad remaining rows with zeros
+        while ((int)result.size() < (N * (N + 1) - 1)) {
+            if (!result.empty()) result += ",";
+            result += std::string(N, '0');
+        }
+        return result;
+    };
+    
+    // First move: always center (empty board)
+    std::vector<std::string> empty_rows(N, std::string(N, '0'));
+    std::string empty_board = make_board_str(empty_rows);
+    std::string key1 = empty_board;
+    key1.erase(std::remove(key1.begin(), key1.end(), ','), key1.end());
+    opening_book[key1 + "_R"] = {N/2, N/2};  // Red's first move
+    
+    // Second move: Blue's response after Red plays center (5,5)
+    std::vector<std::string> after_center_rows = empty_rows;
+    after_center_rows[5][5] = 'R';
+    std::string after_center = make_board_str(after_center_rows);
+    std::string key2 = after_center;
+    key2.erase(std::remove(key2.begin(), key2.end(), ','), key2.end());
+    opening_book[key2 + "_B"] = {5, 4};   // Adjacent to center
+    
+    // Third move: Red's response after Red(5,5) -> Blue(5,4)
+    std::vector<std::string> after_second_rows = after_center_rows;
+    after_second_rows[5][4] = 'B';
+    std::string after_second = make_board_str(after_second_rows);
+    std::string key3 = after_second;
+    key3.erase(std::remove(key3.begin(), key3.end(), ','), key3.end());
+    opening_book[key3 + "_R"] = {5, 6};  // Continue connection
+    
+    // Alternative: After Red(5,5) -> Blue(4,5)
+    std::vector<std::string> alt_second_rows = after_center_rows;
+    alt_second_rows[4][5] = 'B';
+    std::string alt_second = make_board_str(alt_second_rows);
+    std::string key4 = alt_second;
+    key4.erase(std::remove(key4.begin(), key4.end(), ','), key4.end());
+    opening_book[key4 + "_R"] = {6, 5};
+}
+
+std::optional<Move> get_book_move(const HexBoard& board, Player to_move, int empty_count) {
+    // Only use book for first few moves
+    const int N = board.size();
+    const int total_cells = N * N;
+    
+    if (empty_count < total_cells - BOOK_DEPTH) {
+        return std::nullopt;  // Too deep, don't use book
+    }
+    
+    init_opening_book();
+    
+    // Create key: board state + player
+    std::string key = board.serialize();
+    // Remove commas for key (more compact)
+    key.erase(std::remove(key.begin(), key.end(), ','), key.end());
+    key += "_";
+    key += (to_move == Player::Red ? "R" : "B");
+    
+    auto it = opening_book.find(key);
+    if (it != opening_book.end()) {
+        // Verify the move is still legal
+        Move m = it->second;
+        if (board.get(m.row, m.col) == CellState::Empty) {
+            return m;
+        }
+    }
+    
+    return std::nullopt;
+}
 
 // -------------------- Engine stdin protocol --------------------
 
@@ -460,6 +551,61 @@ struct Node {
         : move(m), player_just_moved(pjm), state(s), parent(par) {}
 };
 
+// -------------------------- Dynamic Parameter Tuning --------------------------
+
+struct DynamicParams {
+    double rave_k;
+    double c_puct;
+    int value_switch_empty;
+};
+
+DynamicParams compute_dynamic_params(int empty_count, int board_size) {
+    DynamicParams params;
+    
+    if (!USE_DYNAMIC_PARAMS) {
+        // Use base parameters
+        params.rave_k = BASE_RAVE_K;
+        params.c_puct = BASE_C_PUCT;
+        params.value_switch_empty = BASE_VALUE_SWITCH_EMPTY;
+        return params;
+    }
+    
+    const int total_cells = board_size * board_size;
+    const double game_progress = 1.0 - (double)empty_count / total_cells;  // 0.0 (start) to 1.0 (end)
+    
+    // RAVE_K: 초반에는 높게 (RAVE 신뢰), 후반에는 낮게 (UCT 신뢰)
+    // 초반(0-30%): 300, 중반(30-70%): 200, 후반(70-100%): 100
+    if (game_progress < 0.3) {
+        params.rave_k = 300.0;  // 초반: RAVE 많이 사용
+    } else if (game_progress < 0.7) {
+        params.rave_k = 200.0;  // 중반: 기본값
+    } else {
+        params.rave_k = 100.0;  // 후반: UCT 더 신뢰
+    }
+    
+    // C_PUCT: 초반에는 높게 (탐색), 후반에는 낮게 (exploitation)
+    // 초반(0-40%): 1.0, 중반(40-80%): 0.8, 후반(80-100%): 0.6
+    if (game_progress < 0.4) {
+        params.c_puct = 1.0;   // 초반: 더 많은 탐색
+    } else if (game_progress < 0.8) {
+        params.c_puct = 0.8;   // 중반: 기본값
+    } else {
+        params.c_puct = 0.6;   // 후반: exploitation 강화
+    }
+    
+    // VALUE_SWITCH_EMPTY: 게임 단계에 따라 조정
+    // 초반에는 rollout 더 사용, 후반에는 NN value 더 사용
+    if (game_progress < 0.3) {
+        params.value_switch_empty = 40;  // 초반: rollout 더 사용
+    } else if (game_progress < 0.6) {
+        params.value_switch_empty = 45;  // 중반: 기본값
+    } else {
+        params.value_switch_empty = 50;  // 후반: NN value 더 사용
+    }
+    
+    return params;
+}
+
 // -------------------------- MCTS Core --------------------------
 
 class MCTS {
@@ -471,8 +617,22 @@ class MCTS {
         auto legal = root_state.legal_moves();
         if (legal.empty()) return {-1, -1};
 
-        // quick opening: center
-        if (root_state.empty_count() == N * N) return {N/2, N/2};
+        // Try opening book first
+        int empty_count = root_state.empty_count();
+        auto book_move = get_book_move(root_state, to_move, empty_count);
+        if (book_move.has_value()) {
+            Move m = book_move.value();
+            // Verify move is legal (safety check)
+            if (root_state.get(m.row, m.col) == CellState::Empty) {
+                return m;
+            }
+        }
+        
+        // Fallback: quick opening center (if book doesn't have it)
+        if (empty_count == N * N) return {N/2, N/2};
+
+        // Compute dynamic parameters based on game phase
+        current_params_ = compute_dynamic_params(empty_count, N);
 
         root_player_ = to_move;
         Node root(root_state, opposite(to_move), nullptr, Move{});
@@ -608,15 +768,17 @@ class MCTS {
             // Q from root perspective
             double Q = (ch->visits > 0) ? (ch->value_sum / ch->visits) : 0.0;
 
-            // U (PUCT)
-            double U = C_PUCT * (double)edge.prior * (sqrt_parent / (1.0 + ch->visits));
+            // U (PUCT) - use dynamic parameter
+            double c_puct = current_params_.c_puct;
+            double U = c_puct * (double)edge.prior * (sqrt_parent / (1.0 + ch->visits));
 
             double score = Q + U;
 
-            // Optional: blend with AMAF in early game
-            if (RAVE_K > 0.0) {
+            // Optional: blend with AMAF in early game - use dynamic parameter
+            double rave_k = current_params_.rave_k;
+            if (rave_k > 0.0) {
                 double amaf = (ch->amaf_visits > 0) ? (ch->amaf_value_sum / ch->amaf_visits) : 0.0;
-                double beta = std::sqrt(RAVE_K / (3.0 * std::max(1, ch->visits) + RAVE_K));
+                double beta = std::sqrt(rave_k / (3.0 * std::max(1, ch->visits) + rave_k));
                 // Blend only the Q part (not the U term)
                 score = (1.0 - beta) * (Q + U) + beta * (amaf + U);
             }
@@ -695,7 +857,9 @@ class MCTS {
             else v_root = (w.value() == root_player_) ? 1.0 : -1.0;
         } else {
             int empty = node->state.empty_count();
-            if (empty <= VALUE_SWITCH_EMPTY && nn_) {
+            // Use dynamic parameter for value switch threshold
+            int value_switch_empty = current_params_.value_switch_empty;
+            if (empty <= value_switch_empty && nn_) {
                 // value net: returned from perspective of current player-to-move at this leaf
                 NNResult r = nn_eval_cached(node->state, current);
                 double v_leaf_pov = (double)r.value; // leaf player's perspective
@@ -715,7 +879,9 @@ class MCTS {
             bp->value_sum += v_root;
 
             // RAVE update: update children edges based on whether their move appeared in playout
-            if (RAVE_K > 0.0) {
+            // Use dynamic parameter
+            double rave_k = current_params_.rave_k;
+            if (rave_k > 0.0) {
                 for (auto& edge : bp->children) {
                     Node* ch = edge.node.get();
                     if (!ch || ch->move.is_swap()) continue;
@@ -767,6 +933,7 @@ class MCTS {
     std::mt19937& rng_;
     NNPipe* nn_ = nullptr;
     Player root_player_ = Player::Red;
+    DynamicParams current_params_;  // Current dynamic parameters for this search
 };
 
 // ------------------------- Agent wrapper ------------------------
@@ -869,15 +1036,15 @@ int main(int argc, char** argv) {
     // 7: VALUE_SWITCH_EMPTY (optional)
     // 8: C_PUCT (optional)
 
-    if (argc >= 4) { try { RAVE_K = std::stod(argv[3]); } catch (...) {} }
+    if (argc >= 4) { try { BASE_RAVE_K = std::stod(argv[3]); } catch (...) {} }
     std::string pyexe, server_path, model_path;
     if (argc >= 7) {
         pyexe = argv[4];
         server_path = argv[5];
         model_path = argv[6];
     }
-    if (argc >= 8) { try { VALUE_SWITCH_EMPTY = std::stoi(argv[7]); } catch (...) {} }
-    if (argc >= 9) { try { C_PUCT = std::stod(argv[8]); } catch (...) {} }
+    if (argc >= 8) { try { BASE_VALUE_SWITCH_EMPTY = std::stoi(argv[7]); } catch (...) {} }
+    if (argc >= 9) { try { BASE_C_PUCT = std::stod(argv[8]); } catch (...) {} }
 
     std::cerr << ">>> Hybrid MCTS (PUCT+optional RAVE, rollout early, value late) <<<\n";
     if (!pyexe.empty()) std::cerr << "NN enabled via: " << pyexe << " " << server_path << "\n";
